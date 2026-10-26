@@ -7,6 +7,7 @@
  */
 
 import { promises as dnsPromises } from 'node:dns';
+import { config } from '../../config.js';
 import { activeProvider, providerName } from './providers.js';
 
 let resolver = dnsPromises;
@@ -46,9 +47,10 @@ export async function checkDomain(domain, { dkimSelectors = [] } = {}) {
   try {
     // ---- SPF: one record, naming the provider
     const spf = (await txt(name)).filter((r) => /^v=spf1\b/i.test(r));
-    const include = SPF_INCLUDES[provider];
+    const gmail = provider === 'smtp' && config.email.smtp.gmail;
+    const include = gmail ? '_spf.google.com' : SPF_INCLUDES[provider];
     if (!spf.length) {
-      add('spf', 'SPF', 'missing', 'No SPF record.', `Add a TXT record on ${name}: v=spf1 ${include ? `include:${include} ` : ''}include:_spf.google.com ~all`);
+      add('spf', 'SPF', 'missing', 'No SPF record.', `Add a TXT record on ${name}: v=spf1 ${include && include !== '_spf.google.com' ? `include:${include} ` : ''}include:_spf.google.com ~all`);
     } else if (spf.length > 1) {
       add('spf', 'SPF', 'problem', `There are ${spf.length} SPF records; receivers treat that as none.`, 'Merge them into one TXT record.');
     } else if (include && !spf[0].includes(include)) {
@@ -59,6 +61,8 @@ export async function checkDomain(domain, { dkimSelectors = [] } = {}) {
     }
 
     // ---- DKIM: the selectors the provider gave, or the provider's own status
+    // Google Workspace signs with the "google" selector unless it was changed
+    if (gmail && !dkimSelectors.includes('google')) dkimSelectors = ['google', ...dkimSelectors];
     if (provider === 'ses') {
       try {
         const identity = await activeProvider().identity(name);
@@ -79,7 +83,11 @@ export async function checkDomain(domain, { dkimSelectors = [] } = {}) {
         const host = `${selector}._domainkey.${name}`;
         const [records, aliases] = await Promise.all([txt(host), cname(host)]);
         if (records.some((r) => /v=DKIM1|k=rsa|p=/i.test(r)) || aliases.length) add(`dkim:${selector}`, `DKIM (${selector})`, 'ok', aliases[0] ? `Points to ${aliases[0]}` : 'Key published.');
-        else add(`dkim:${selector}`, `DKIM (${selector})`, 'missing', `Nothing at ${host}.`, 'Publish the DKIM record your email provider gives you.');
+        else {
+          add(`dkim:${selector}`, `DKIM (${selector})`, 'missing', `Nothing at ${host}.`, gmail && selector === 'google'
+            ? 'In the Google Admin console → Apps → Google Workspace → Gmail → Authenticate email: generate the DKIM key for this domain, publish the TXT record it shows, then press Start authentication.'
+            : 'Publish the DKIM record your email provider gives you.');
+        }
       }
     } else {
       add('dkim', 'DKIM', 'unknown', 'No DKIM selector is set, so it cannot be checked here.', 'Add the selector your provider gave you (Settings → Sending domain), e.g. "brevo1".');

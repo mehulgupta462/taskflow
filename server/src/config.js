@@ -12,6 +12,32 @@ const int = (value, fallback) => {
 };
 
 
+const GMAIL_SMTP_HOSTS = ['smtp.gmail.com', 'smtp-relay.gmail.com'];
+export const isGmailSmtp = (host) => GMAIL_SMTP_HOSTS.includes(String(host || '').trim().toLowerCase());
+
+// SMTP, including a Google Workspace mailbox. Gmail allows about 2,000 emails a
+// day per mailbox and stops the whole mailbox sending for a day past that, so
+// for Gmail the queue keeps under a cap unless one is set.
+function smtpEnv() {
+  const host = process.env.SMTP_HOST || '';
+  const port = int(process.env.SMTP_PORT, 587);
+  const gmail = isGmailSmtp(host);
+  return {
+    host,
+    port,
+    user: process.env.SMTP_USER || '',
+    password: process.env.SMTP_PASSWORD || '',
+    // 465 is SMTP over TLS from the start; 587 upgrades with STARTTLS
+    secure: bool(process.env.SMTP_SECURE, port === 465),
+    gmail,
+    // 0 = no cap
+    maxPerDay: int(process.env.SMTP_MAX_PER_DAY, gmail ? 1800 : 0),
+    maxPerMinute: int(process.env.SMTP_MAX_PER_MINUTE, gmail ? 20 : 0),
+    // Gmail sends only as the signed-in mailbox or its "Send mail as" aliases
+    sendAs: String(process.env.SMTP_SEND_AS || '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean),
+  };
+}
+
 // Email marketing settings from the environment, read when asked (so a test or
 // a restarted worker sees the current values). Credentials live only here,
 // never in the database or any API response. See docs/EMAIL_MARKETING.md.
@@ -20,13 +46,7 @@ function readEmailEnv() {
     // log (records, never delivers) | smtp | ses | brevo. Unset in production
     // means sending is not set up.
     provider: (process.env.EMAIL_PROVIDER || '').toLowerCase(),
-    smtp: {
-      host: process.env.SMTP_HOST || '',
-      port: int(process.env.SMTP_PORT, 587),
-      user: process.env.SMTP_USER || '',
-      password: process.env.SMTP_PASSWORD || '',
-      secure: bool(process.env.SMTP_SECURE, false),
-    },
+    smtp: smtpEnv(),
     ses: {
       region: process.env.AWS_SES_REGION || 'ap-south-1',
       accessKeyId: process.env.AWS_SES_ACCESS_KEY_ID || '',

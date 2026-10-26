@@ -69,6 +69,7 @@ export function startMarketingWorker() {
       const out = await runMarketingTick();
       const sent = out.queue?.sent || 0;
       if (sent || out.queue?.failed) console.log(`[taskflow] email marketing: sent ${sent}, failed ${out.queue?.failed || 0}`);
+      if (out.queue?.paused) console.warn(`[taskflow] email marketing: sending paused — ${out.queue.paused} email(s) wait for the mailbox (see Email marketing → Settings)`);
     } catch (err) {
       console.error('[taskflow] email marketing worker failed:', err.message);
     } finally {

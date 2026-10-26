@@ -4,9 +4,11 @@
  *
  *   log    records every message on the server and never delivers it — for
  *          development, tests and a staging site. Never the default in production.
- *   smtp   any SMTP service (Amazon SES SMTP, Zoho ZeptoMail, Google Workspace
- *          relay…). Sends only; SMTP has no delivery reports, so bounces and
- *          complaints are not seen unless the service also posts webhooks.
+ *   smtp   any SMTP service (a Google Workspace mailbox, Amazon SES SMTP, Zoho
+ *          ZeptoMail…), through nodemailer. Sends only; SMTP has no delivery
+ *          reports, so bounces and complaints are not seen unless the service
+ *          also posts webhooks. Through Gmail the queue keeps under the
+ *          mailbox's daily limit (config.email.smtp.maxPerDay).
  *   ses    Amazon SES API v2 — the recommended choice: cheapest at volume, with
  *          delivery, bounce and complaint events through SNS.
  *   brevo  Brevo's transactional API, with its webhook events.
@@ -15,7 +17,10 @@
  * them; `status()` says only which are present.
  *
  * Every send result is { providerMessageId }. A failure throws a SendError
- * whose `transient` says whether trying again later could work.
+ * whose `transient` says whether trying again later could work. `pause` means
+ * the problem is the sending account, not this email (a wrong password, a
+ * daily limit): the queue stops for `retryAfterMinutes` and nothing waiting is
+ * counted as an attempt or failed.
  */
 
 import crypto from 'node:crypto';
@@ -24,10 +29,12 @@ import { signRequest } from '../../lib/awsSign.js';
 import { buildMime } from '../../lib/mime.js';
 
 export class SendError extends Error {
-  constructor(message, { transient = false, code = null } = {}) {
+  constructor(message, { transient = false, code = null, pause = false, retryAfterMinutes = null } = {}) {
     super(message);
-    this.transient = transient;
+    this.transient = transient || pause;
     this.code = code;
+    this.pause = pause;
+    this.retryAfterMinutes = retryAfterMinutes;
   }
 }
 
@@ -61,9 +68,33 @@ const logProvider = {
 // ---------------------------------------------------------------- SMTP
 
 let smtpTransport = null;
+// tests hand in a stand-in for nodemailer's transport
+export const setSmtpTransportForTests = (fake) => { smtpTransport = fake; };
+
+/**
+ * An SMTP failure → SendError. 4xx is "try later"; 5xx is a refusal of this
+ * email; no code is a connection problem. A login refused or a sending limit
+ * reached is about the account, so the queue pauses instead.
+ */
+export function smtpError(err, { gmail = false } = {}) {
+  const code = Number(err.responseCode);
+  const text = String(err.response || err.message || '');
+  const where = gmail ? 'Gmail' : 'The SMTP server';
+  if (err.code === 'EAUTH' || code === 535 || code === 534) {
+    return Object.assign(new SendError(`${where} refused the login: check SMTP_USER and SMTP_PASSWORD${gmail ? ' (an app password for that mailbox)' : ''}. ${text}`.trim(),
+      { pause: true, retryAfterMinutes: 30, code: err.responseCode || err.code }), { login: true });
+  }
+  // 5.4.5: daily sending limit reached; 4.7.x: too many, too fast
+  if (/\b5\.4\.5\b/.test(text) || ((code === 421 || code === 454) && /\b4\.7\.\d+\b/.test(text))) {
+    return new SendError(`${where} is limiting how much this mailbox sends; sending resumes later. ${text}`.trim(),
+      { pause: true, retryAfterMinutes: 60, code: err.responseCode });
+  }
+  return new SendError(err.message, { transient: !code || (code >= 400 && code < 500), code: err.responseCode || err.code });
+}
+
 const smtpProvider = {
   name: 'smtp',
-  label: 'SMTP',
+  get label() { return config.email.smtp.gmail ? 'Google Workspace (SMTP)' : 'SMTP'; },
   events: { delivery: false, bounce: false, complaint: false },
   missing: () => {
     const s = config.email.smtp;
@@ -83,9 +114,13 @@ const smtpProvider = {
       await smtpTransport.sendMail({ envelope: { from: message.from, to: [message.to] }, raw });
       return { providerMessageId: messageId.slice(1, -1) };
     } catch (err) {
-      const code = Number(err.responseCode);
-      // 4xx is "try later"; 5xx is a refusal; no code is a connection problem
-      throw new SendError(err.message, { transient: !code || (code >= 400 && code < 500), code: err.responseCode || err.code });
+      const error = smtpError(err, { gmail: s.gmail });
+      // connect afresh next time rather than reuse a login the server refused
+      if (error.login) {
+        smtpTransport?.close?.();
+        smtpTransport = null;
+      }
+      throw error;
     }
   },
 };
@@ -189,6 +224,13 @@ const brevoProvider = {
   },
 };
 
+/** The addresses a Gmail mailbox can send as (empty for anything else: no rule). */
+export function gmailSenders() {
+  const s = config.email.smtp;
+  if (providerName() !== 'smtp' || !s.gmail || !s.user) return [];
+  return [s.user.trim().toLowerCase(), ...s.sendAs];
+}
+
 const PROVIDERS = { log: logProvider, smtp: smtpProvider, ses: sesProvider, brevo: brevoProvider };
 
 /** The provider in use. In production nothing is chosen for you. */
@@ -219,6 +261,13 @@ export function providerStatus() {
     delivers: name !== 'log',
     events: provider.events,
     region: name === 'ses' ? config.email.ses.region : undefined,
+    // the sending address, never the password
+    ...(name === 'smtp' ? {
+      account: config.email.smtp.user || null,
+      sendAs: config.email.smtp.sendAs,
+      gmail: config.email.smtp.gmail,
+      limits: { perDay: config.email.smtp.maxPerDay, perMinute: config.email.smtp.maxPerMinute },
+    } : {}),
     webhook: {
       ses: `${config.publicUrl}${config.apiPrefix}/m/webhooks/ses`,
       brevo: config.email.webhookSecret ? `${config.publicUrl}${config.apiPrefix}/m/webhooks/brevo/<EMAIL_WEBHOOK_SECRET>` : null,

@@ -511,7 +511,7 @@ permission. See `docs/EMAIL_MARKETING.md` for how the module works.
 | GET | `/marketing/followups`, `/marketing/reports/audiences` | view |
 | POST | `/marketing/messages/:id/events` | manage — `{ type: REPLY \| CONVERSION, value, note }` recorded by hand, once |
 | POST | `/marketing/ai` | manage — `{ task, text, context, language }`; 30 a person per 10 minutes; 400 when `ANTHROPIC_API_KEY` is not set |
-| GET | `/marketing/settings` | view — settings, provider status (never a credential), webhook addresses |
+| GET | `/marketing/settings` | view — settings, provider status (never a credential; for SMTP the sending address, its caps and `sentLast24h`), webhook addresses |
 | PUT | `/marketing/settings` | settings — partial; nested groups are merged |
 | POST | `/marketing/settings/dns-check`, `/sync-crm`, `/sync-replies`; `/marketing/worker/run` | settings |
 | GET | `/marketing/suppressions`; `/suppressions.csv`, `/consents.csv` | view; export |

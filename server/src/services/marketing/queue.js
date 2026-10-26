@@ -11,13 +11,19 @@
  * retried with growing gaps; a refusal is not. A message the sender stopped
  * part-way through handing over is marked failed and not resent automatically,
  * because it may already have arrived — a duplicate is worse than a gap.
+ *
+ * A problem with the sending account itself (a refused login, a mailbox's
+ * daily limit) pauses the queue instead: nothing waiting uses up an attempt.
+ * Through a Gmail mailbox the queue also keeps under its daily and per-minute
+ * caps, carrying the rest of a campaign over to later.
  */
 
 import { query, withTransaction } from '../../db/pool.js';
 import { badRequest } from '../../lib/errors.js';
 import { applyMerge, designLinks, renderEmail } from '../../lib/emailRender.js';
 import { domainOf, isSuppressed, localParts, marketingSettings, newReplyCode, newToken, normalizeEmail, publicBase } from './core.js';
-import { SendError, activeProvider, providerName, providerStatus } from './providers.js';
+import { config } from '../../config.js';
+import { SendError, activeProvider, gmailSenders, providerName, providerStatus } from './providers.js';
 
 const RETRY_MINUTES = [1, 5, 30, 120];
 export const MAX_ATTEMPTS = RETRY_MINUTES.length + 1;
@@ -60,6 +66,51 @@ export function senderAllowed(from, settings) {
   if (!from || !from.includes('@')) return false;
   const list = (settings.senders || []).map((s) => normalizeEmail(s.email || s));
   return !list.length || list.includes(normalizeEmail(from));
+}
+
+/** Gmail sends only as its own mailbox (or an alias), whatever From says: refuse anything else rather than send under another name. */
+export function gmailSenderProblem(from) {
+  const allowed = gmailSenders();
+  if (!allowed.length || allowed.includes(normalizeEmail(from))) return null;
+  return `Gmail sends only as ${allowed.join(', ')} — set that as the sender, or add ${from} as a "Send mail as" alias in Gmail and to SMTP_SEND_AS`;
+}
+
+/** How many more emails the SMTP mailbox may send now, under its caps; null when it has none. */
+export async function smtpAllowance() {
+  const { maxPerDay, maxPerMinute } = config.email.smtp;
+  if (providerName() !== 'smtp' || (!maxPerDay && !maxPerMinute)) return null;
+  // Gmail's day is a rolling 24 hours
+  const { rows } = await query(
+    `SELECT count(*)::int AS day, count(*) FILTER (WHERE sent_at > now() - interval '1 minute')::int AS minute
+       FROM mkt_messages WHERE provider = 'smtp' AND sent_at > now() - interval '24 hours'`,
+  );
+  const { day, minute } = rows[0];
+  const dayLeft = maxPerDay ? Math.max(0, maxPerDay - day) : Infinity;
+  const minuteLeft = maxPerMinute ? Math.max(0, maxPerMinute - minute) : Infinity;
+  return {
+    sentLast24h: day, perDay: maxPerDay, perMinute: maxPerMinute,
+    left: Math.min(dayLeft, minuteLeft),
+    reason: dayLeft === 0 ? 'DAILY_LIMIT' : minuteLeft === 0 ? 'RATE_LIMIT' : null,
+  };
+}
+
+// Sending paused because of the account (until a time, on this server): retrying
+// a refused login every tick could get the mailbox locked. A restart, which is
+// how a corrected password takes effect, clears it.
+let pausedUntil = 0;
+let pauseReason = null;
+export const queuePause = () => (pausedUntil > Date.now() ? { until: new Date(pausedUntil).toISOString(), reason: pauseReason } : null);
+export const clearQueuePause = () => { pausedUntil = 0; pauseReason = null; };
+
+/** Puts claimed messages back in the queue without counting the attempt, to try after `minutes`. */
+async function release(ids, minutes, error = null) {
+  if (!ids.length) return;
+  await query(
+    `UPDATE mkt_messages SET status = 'QUEUED', attempts = GREATEST(attempts - 1, 0), locked_until = NULL,
+            next_attempt_at = now() + make_interval(mins => $2), last_error = COALESCE($3, last_error)
+      WHERE id = ANY($1::bigint[]) AND status = 'SENDING'`,
+    [ids, minutes, error ? String(error).slice(0, 500) : null],
+  );
 }
 
 /** Why this person must not get this message now, or null. */
@@ -276,6 +327,11 @@ async function sendOne(message, cache, settings, provider) {
       [message.id, sender.from ? `${sender.from} is not on the list of approved senders` : 'No sender address is set (Email marketing → Settings)']);
     return 'failed';
   }
+  const gmailProblem = gmailSenderProblem(sender.from);
+  if (gmailProblem) {
+    await query(`UPDATE mkt_messages SET status = 'FAILED', last_error = $2, locked_until = NULL WHERE id = $1`, [message.id, gmailProblem]);
+    return 'failed';
+  }
   if (!settings.postalAddress && message.kind !== 'TEST') {
     await query(`UPDATE mkt_messages SET status = 'FAILED', last_error = 'The postal address for the footer is not set (Email marketing → Settings)', locked_until = NULL WHERE id = $1`, [message.id]);
     return 'failed';
@@ -320,6 +376,13 @@ async function sendOne(message, cache, settings, provider) {
     });
     return 'sent';
   } catch (err) {
+    if (err instanceof SendError && err.pause) {
+      const minutes = err.retryAfterMinutes || 60;
+      pausedUntil = Date.now() + minutes * 60_000;
+      pauseReason = String(err.message).slice(0, 500);
+      await release([message.id], minutes, err.message);
+      return 'paused';
+    }
     const transient = err instanceof SendError ? err.transient : true;
     if (transient && message.attempts < MAX_ATTEMPTS) {
       const wait = RETRY_MINUTES[Math.min(message.attempts - 1, RETRY_MINUTES.length - 1)];
@@ -347,7 +410,7 @@ export async function processQueue({ limit = 50, onlyIds = null } = {}) {
   const settings = await marketingSettings();
   const provider = activeProvider();
   const status = providerStatus();
-  const counts = { sent: 0, skipped: 0, retry: 0, failed: 0, deferred: 0, recovered: 0 };
+  const counts = { sent: 0, skipped: 0, retry: 0, failed: 0, deferred: 0, recovered: 0, paused: 0 };
 
   // a send interrupted part-way is not repeated: it may have arrived
   const { rowCount: recovered } = await query(
@@ -357,6 +420,12 @@ export async function processQueue({ limit = 50, onlyIds = null } = {}) {
   );
   counts.recovered = recovered;
   if (!provider || !status.configured) return { ...counts, notConfigured: true };
+  if (queuePause()) return { ...counts, held: 'PAUSED' };
+  const allowance = await smtpAllowance();
+  if (allowance) {
+    if (allowance.left === 0) return { ...counts, held: allowance.reason };
+    limit = Math.min(limit, allowance.left);
+  }
 
   const { rows: claimed } = await query(
     `UPDATE mkt_messages SET status = 'SENDING', attempts = attempts + 1, locked_until = now() + interval '5 minutes'
@@ -374,9 +443,16 @@ export async function processQueue({ limit = 50, onlyIds = null } = {}) {
     [limit, onlyIds],
   );
   const cache = new Map();
-  for (const message of claimed) {
-    const outcome = await sendOne(message, cache, settings, provider);
+  for (let i = 0; i < claimed.length; i += 1) {
+    const outcome = await sendOne(claimed[i], cache, settings, provider);
     counts[outcome] = (counts[outcome] || 0) + 1;
+    if (outcome === 'paused') {
+      // the account is the problem, so the rest would fail the same way
+      const rest = claimed.slice(i + 1).map((m) => m.id);
+      await release(rest, Math.max(1, Math.round((pausedUntil - Date.now()) / 60_000)));
+      counts.paused += rest.length;
+      break;
+    }
   }
 
   // a campaign is sent when nothing of it is waiting any more

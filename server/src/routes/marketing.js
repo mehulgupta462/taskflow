@@ -36,7 +36,7 @@ import {
   ACTIONS, CONDITIONS, NODE_TYPES, TASKFLOW_EVENTS, TRIGGERS, approveWorkflow, enrollManually, enrollmentsFor, getWorkflow,
   listWorkflows, saveWorkflow, setWorkflowStatus, submitWorkflow, validateWorkflow,
 } from '../services/marketing/automations.js';
-import { brandFor, personFor, retryFailed, sendTest } from '../services/marketing/queue.js';
+import { brandFor, personFor, queuePause, retryFailed, sendTest, smtpAllowance } from '../services/marketing/queue.js';
 import { recordEvent } from '../services/marketing/events.js';
 import { listFollowUps } from '../services/marketing/followups.js';
 import {
@@ -695,11 +695,12 @@ router.post('/ai', manage, asyncHandler(async (req, res) => {
 
 // ---------------------------------------------------------------- settings, compliance and delivery
 
-function settingsView(settings) {
+async function settingsView(settings) {
   const base = publicBase();
+  const allowance = await smtpAllowance();
   return {
     settings,
-    provider: providerStatus(),
+    provider: { ...providerStatus(), ...(allowance ? { sentLast24h: allowance.sentLast24h } : {}), paused: queuePause() },
     replies: repliesStatus(settings),
     endpoints: {
       ses_sns: `${base}/webhooks/ses`,
@@ -718,7 +719,7 @@ function settingsView(settings) {
   };
 }
 
-router.get('/settings', asyncHandler(async (req, res) => res.json(settingsView(await marketingSettings()))));
+router.get('/settings', asyncHandler(async (req, res) => res.json(await settingsView(await marketingSettings()))));
 
 const settingsInput = z.object({
   enabled: z.boolean(),
@@ -752,7 +753,7 @@ router.put('/settings', settingsOnly, asyncHandler(async (req, res) => {
   for (const key of ['approvals', 'limits', 'followUps', 'crmSync', 'replies', 'sto']) if (changes[key]) next[key] = { ...current[key], ...changes[key] };
   if (changes.senders) next.senders = changes.senders.map((s) => ({ email: normalizeEmail(s.email), name: s.name || '' }));
   await updateSetting('marketing', next, req.currentUser.id);
-  res.json(settingsView(await marketingSettings()));
+  res.json(await settingsView(await marketingSettings()));
 }));
 
 router.post('/settings/dns-check', settingsOnly, asyncHandler(async (req, res) => {

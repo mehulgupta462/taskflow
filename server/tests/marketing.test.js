@@ -31,10 +31,11 @@ const { getAccount } = await import('../src/services/crm.js');
 const { applyMerge, checkDesign, renderEmail, stripActiveHtml } = await import('../src/lib/emailRender.js');
 const { buildMime, encodeWord, parseMime } = await import('../src/lib/mime.js');
 const { signRequest, signingKey } = await import('../src/lib/awsSign.js');
-const { clearOutbox, outbox, parseBrevo, parseSesEvent, snsStringToSign, verifySns } = await import('../src/services/marketing/providers.js');
+const { clearOutbox, outbox, parseBrevo, parseSesEvent, setSmtpTransportForTests, smtpError, snsStringToSign, verifySns } = await import('../src/services/marketing/providers.js');
 const { bestHour, engagementScore, looksAutomatic } = await import('../src/services/marketing/events.js');
 const { compileRules } = await import('../src/services/marketing/segments.js');
 const { pickWinner, splitForTest, startCampaign } = await import('../src/services/marketing/campaigns.js');
+const { clearQueuePause } = await import('../src/services/marketing/queue.js');
 const { isAutomaticReply, normalizeInbound } = await import('../src/services/marketing/replies.js');
 const { sniffImage } = await import('../src/services/marketing/templates.js');
 const { setAiClientForTests } = await import('../src/services/marketing/ai.js');
@@ -348,6 +349,55 @@ test('the DNS check reports SPF, DKIM and DMARC and what to fix', async () => {
   assert.match(by.dmarc.fix, /_dmarc\.ekosight\.com/);
   assert.equal(result.ready, false);
   setResolverForTests(null);
+});
+
+const GMAIL_ENV = ['EMAIL_PROVIDER', 'SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_SECURE', 'SMTP_MAX_PER_DAY', 'SMTP_MAX_PER_MINUTE', 'SMTP_SEND_AS'];
+/** Sending through a Google Workspace mailbox, for one test. */
+function useGmail(t, extra = {}) {
+  Object.assign(process.env, { EMAIL_PROVIDER: 'smtp', SMTP_HOST: 'smtp.gmail.com', SMTP_PORT: '465', SMTP_USER: 'news@ekosight.com', SMTP_PASSWORD: 'app-password', ...extra });
+  t.after(() => {
+    for (const key of GMAIL_ENV) delete process.env[key];
+    setSmtpTransportForTests(null);
+    setResolverForTests(null);
+    clearQueuePause();
+  });
+}
+
+test('Gmail SMTP errors: a refused login or a sending limit pauses the queue; a bad address fails only that email', () => {
+  const login = smtpError(Object.assign(new Error('Invalid login: 535-5.7.8 Username and Password not accepted'), { code: 'EAUTH', responseCode: 535 }), { gmail: true });
+  assert.equal(login.pause, true);
+  assert.equal(login.login, true);
+  assert.match(login.message, /app password/);
+  const daily = smtpError(Object.assign(new Error('x'), { responseCode: 550, response: '550 5.4.5 Daily user sending limit exceeded.' }), { gmail: true });
+  assert.equal(daily.pause, true);
+  assert.equal(daily.retryAfterMinutes, 60);
+  const burst = smtpError(Object.assign(new Error('x'), { responseCode: 421, response: '421 4.7.0 Try again later, closing connection.' }), { gmail: true });
+  assert.equal(burst.pause, true);
+  const nobody = smtpError(Object.assign(new Error('x'), { responseCode: 550, response: '550 5.1.1 The email account that you tried to reach does not exist.' }), { gmail: true });
+  assert.equal(nobody.pause, false);
+  assert.equal(nobody.transient, false);
+  const busy = smtpError(Object.assign(new Error('x'), { responseCode: 451, response: '451 4.3.0 Temporary server error' }));
+  assert.equal(busy.pause, false);
+  assert.equal(busy.transient, true);
+  assert.equal(smtpError(Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' })).transient, true);
+});
+
+test('with Gmail, the DNS check expects Google’s SPF and its "google" DKIM key', async (t) => {
+  useGmail(t);
+  setResolverForTests({
+    resolveTxt: async (name) => {
+      if (name === 'ekosight.com') return [['v=spf1 include:amazonses.com ~all']];
+      const err = new Error('none'); err.code = 'ENODATA'; throw err;
+    },
+    resolveCname: async () => [],
+    resolveNs: async () => ['ns1.example.net'],
+  });
+  const result = await checkDomain('ekosight.com');
+  const by = Object.fromEntries(result.checks.map((c) => [c.key, c]));
+  assert.equal(by.spf.status, 'warning');
+  assert.match(by.spf.fix, /_spf\.google\.com/);
+  assert.equal(by['dkim:google'].status, 'missing');
+  assert.match(by['dkim:google'].fix, /Authenticate email/);
 });
 
 // ================================================================ the module, through its API
@@ -983,6 +1033,80 @@ test('contacts, segments and the overview answer from the same database', async 
   const exported = await call('GET', '/marketing/contacts/export.csv', { token: tokens.mgr1, raw: true });
   assert.equal(exported.status, 200);
   assert.ok(exported.text.includes('ravi@greenvalley.in'));
+});
+
+const gmailTest = (emails) => call('POST', '/marketing/test', {
+  token: tokens.mgr1, body: { subject: 'Through Gmail', design: { blocks: [{ type: 'text', text: 'Hello.' }] }, emails },
+});
+
+test('through Gmail, the sender must be the mailbox or one of its aliases', async (t) => {
+  if (skipIfUnavailable(t)) return;
+  const sent = [];
+  setSmtpTransportForTests({ sendMail: async (mail) => { sent.push(mail); }, close() {} });
+  useGmail(t, { SMTP_USER: 'hello@soildoctor.in' });
+  const settings = await call('GET', '/marketing/settings', { token: tokens.admin });
+  assert.equal(settings.body.provider.label, 'Google Workspace (SMTP)');
+  assert.equal(settings.body.provider.account, 'hello@soildoctor.in');
+  assert.equal(settings.body.provider.limits.perDay, 1800);
+  assert.ok(!JSON.stringify(settings.body).includes('app-password'), 'the password is never shown');
+
+  const refused = await gmailTest(['vartika@ekosight.com']);
+  assert.equal(refused.status, 200, JSON.stringify(refused.body));
+  assert.equal(refused.body.messages[0].status, 'FAILED');
+  assert.match(refused.body.messages[0].last_error, /Gmail sends only as hello@soildoctor\.in/);
+  assert.equal(sent.length, 0);
+
+  process.env.SMTP_SEND_AS = 'news@ekosight.com';
+  const alias = await gmailTest(['vartika@ekosight.com']);
+  assert.equal(alias.body.messages[0].status, 'SENT');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].envelope.from, 'news@ekosight.com');
+  assert.match(sent[0].raw, /Through Gmail/);
+});
+
+test('through Gmail, the queue keeps under the daily cap and carries the rest over', async (t) => {
+  if (skipIfUnavailable(t)) return;
+  const sent = [];
+  setSmtpTransportForTests({ sendMail: async (mail) => { sent.push(mail); }, close() {} });
+  const already = (await query(`SELECT count(*)::int AS n FROM mkt_messages WHERE provider = 'smtp' AND sent_at > now() - interval '24 hours'`)).rows[0].n;
+  useGmail(t, { SMTP_MAX_PER_DAY: String(already + 2) });
+  const emails = ['cap1@ekosight.com', 'cap2@ekosight.com', 'cap3@ekosight.com', 'cap4@ekosight.com'];
+  const res = await gmailTest(emails);
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  const by = Object.groupBy(res.body.messages, (m) => m.status);
+  assert.equal(by.SENT.length, 2);
+  assert.equal(by.QUEUED.length, 2, 'the rest wait, rather than failing');
+  const waiting = (await query(`SELECT attempts FROM mkt_messages WHERE id = ANY($1::bigint[])`, [by.QUEUED.map((m) => m.id)])).rows;
+  assert.ok(waiting.every((m) => m.attempts === 0), 'waiting for the cap uses no attempt');
+  assert.equal(sent.length, 2);
+  const view = await call('GET', '/marketing/settings', { token: tokens.admin });
+  assert.equal(view.body.provider.sentLast24h, already + 2);
+  // not left for later tests' worker runs
+  await query(`DELETE FROM mkt_messages WHERE id = ANY($1::bigint[])`, [by.QUEUED.map((m) => m.id)]);
+});
+
+test('through Gmail, a refused login pauses sending: nothing waiting fails or uses up an attempt', async (t) => {
+  if (skipIfUnavailable(t)) return;
+  let tries = 0;
+  setSmtpTransportForTests({
+    sendMail: async () => { tries += 1; throw Object.assign(new Error('Invalid login: 535-5.7.8 Username and Password not accepted'), { code: 'EAUTH', responseCode: 535 }); },
+    close() {},
+  });
+  useGmail(t);
+  const res = await gmailTest(['auth1@ekosight.com', 'auth2@ekosight.com', 'auth3@ekosight.com']);
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(tries, 1, 'the first refusal stops the pass');
+  assert.ok(res.body.messages.every((m) => m.status === 'QUEUED'), JSON.stringify(res.body.messages));
+  const rows = (await query(`SELECT attempts, next_attempt_at, last_error FROM mkt_messages WHERE id = ANY($1::bigint[])`, [res.body.messages.map((m) => m.id)])).rows;
+  assert.ok(rows.every((m) => m.attempts === 0 && new Date(m.next_attempt_at) > new Date()));
+  assert.match(rows.find((m) => m.last_error).last_error, /refused the login/);
+  const settings = await call('GET', '/marketing/settings', { token: tokens.admin });
+  assert.match(settings.body.provider.paused.reason, /refused the login/, 'Settings says sending is paused, and why');
+  const again = await gmailTest(['auth4@ekosight.com']);
+  assert.equal(tries, 1, 'no new login is tried while paused');
+  assert.equal(again.body.messages[0].status, 'QUEUED');
+  res.body.messages.push(...again.body.messages);
+  await query(`DELETE FROM mkt_messages WHERE id = ANY($1::bigint[])`, [res.body.messages.map((m) => m.id)]);
 });
 
 test('switching the module off hides the staff API but keeps unsubscribe links working', async (t) => {

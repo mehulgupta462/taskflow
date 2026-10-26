@@ -182,11 +182,18 @@ nothing can be sent in production.
 
 ### 3.1 Choose a provider
 
-| | Amazon SES (recommended) | Brevo | SMTP (Google Workspace, Zoho, etc.) |
+| | Amazon SES | Brevo | SMTP (Google Workspace, Zoho, etc.) |
 |---|---|---|---|
 | Bounces and complaints reported to TaskFlow | Yes (signed SNS) | Yes (webhook) | **No** — suppression is manual |
 | Delivery reported | Yes | Yes | No |
-| Good for bulk | Yes | Yes | Not really: Workspace limits sending and bulk mail risks the company's own mailboxes |
+| Volume | Any | By plan | Google Workspace: about 2,000 a day per mailbox; TaskFlow keeps under 1,800 |
+| Setup | Domain identity, SNS, IAM | Domain, webhook | A mailbox and its app password (§3.5) |
+
+**In use: Google Workspace through SMTP (nodemailer)**, the same setup the
+Soil Doctor website already sends with. It suits newsletters to a few thousand
+people. If the list grows past what one mailbox can send a day, or bounces need
+handling automatically, move to Amazon SES or Brevo: only the environment
+changes.
 
 ### 3.2 Server environment (`server/.env`)
 
@@ -204,7 +211,9 @@ present).
 | `AWS_SES_SNS_TOPIC_ARN` | SES events | Only notifications from this topic are accepted |
 | `BREVO_API_KEY` | Brevo | Transactional API key |
 | `EMAIL_WEBHOOK_SECRET` | Brevo events | A long random string; part of the webhook address |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_SECURE` | SMTP | |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_SECURE` | SMTP | Gmail: `smtp.gmail.com`, `465`, the mailbox, its app password, `true` (§3.5). `SMTP_SECURE` defaults to true on port 465 |
+| `SMTP_MAX_PER_DAY`, `SMTP_MAX_PER_MINUTE` | SMTP | Caps over a rolling 24 hours / a minute. With Gmail `1800` and `20` unless set; `0` = no cap |
+| `SMTP_SEND_AS` | Gmail | Extra "Send mail as" aliases the mailbox may send as, comma-separated |
 | `MARKETING_INBOUND_KEY` | replies via an inbound mail service | A long random string; part of the inbound address |
 | `MARKETING_CONVERSION_KEY` | website conversions | Sent by the website's **server** in `X-TaskFlow-Key` |
 | `ANTHROPIC_API_KEY` | writing assistant | Optional |
@@ -246,7 +255,54 @@ Generate random secrets with
 4. `EMAIL_PROVIDER=brevo`, restart. In Settings, add Brevo's DKIM selector
    (e.g. `brevo1`) so the DNS check can see it.
 
-### 3.5 DNS records for the sending domain
+### 3.5 Google Workspace through SMTP (nodemailer)
+
+1. In the Google account of the sending mailbox (e.g. `hello@soildoctor.in`):
+   turn on **2-Step Verification**, then **App passwords** → create one. That
+   16-character password is `SMTP_PASSWORD` (the website's `EMAIL_PASS`); never
+   the mailbox's own password.
+2. `server/.env`:
+
+   ```
+   EMAIL_PROVIDER=smtp
+   SMTP_HOST=smtp.gmail.com
+   SMTP_PORT=465
+   SMTP_SECURE=true
+   SMTP_USER=hello@soildoctor.in
+   SMTP_PASSWORD=<the app password>
+   ```
+
+   Restart. Email marketing → Settings shows "Google Workspace (SMTP) · Sends
+   as hello@soildoctor.in".
+3. **The sender is the mailbox.** Gmail ignores the From address it is given
+   and sends as `SMTP_USER`. So TaskFlow refuses to send from any other address,
+   and Settings warns if the default sender or an approved sender is different.
+   Set the default sender address to the mailbox. To send as another address
+   (e.g. `news@soildoctor.in`), add it in Gmail → Settings → Accounts → **Send
+   mail as**, then list it in `SMTP_SEND_AS` (comma-separated).
+4. **Daily limit.** Google allows about 2,000 emails a day per Workspace
+   mailbox, counted over a rolling 24 hours. Past that, the whole mailbox stops
+   sending (including people's normal mail) for up to a day. TaskFlow sends at
+   most **1,800 in any 24 hours and 20 a minute**. The rest of a campaign waits
+   in the queue and goes out as the window frees up, so a large campaign takes
+   more than a day. Settings shows how many went in the last 24 hours. Change
+   the caps with `SMTP_MAX_PER_DAY` / `SMTP_MAX_PER_MINUTE`. Mail people send
+   by hand from the same mailbox counts towards Google's limit too.
+5. **If Google refuses.** A refused login (a wrong or revoked app password) or a
+   limit Google reports pauses sending for 30–60 minutes. Nothing waiting is
+   marked failed or uses up a retry, and the reason appears on the waiting
+   emails and in the server log. A refusal of one address (it does not exist)
+   fails only that email.
+6. **DKIM.** In the Google Admin console → Apps → Google Workspace → Gmail →
+   **Authenticate email**: generate the key for the domain, publish the TXT
+   record at `google._domainkey.<domain>`, then press *Start authentication*.
+   SPF needs `include:_spf.google.com`. **Check DNS now** checks both.
+7. **Bounces are manual.** An address that does not exist comes back as a
+   "Delivery Status Notification" email in the mailbox, not to TaskFlow. Add such
+   addresses under Settings → **Never email** so they are not mailed again.
+   Repeated bounces hurt the mailbox's reputation with Gmail.
+
+### 3.6 DNS records for the sending domain
 
 Gmail and Yahoo require SPF, DKIM and DMARC from bulk senders (since February
 2024), plus one-click unsubscribe (built in) and a spam-complaint rate under
@@ -262,7 +318,7 @@ Gmail and Yahoo require SPF, DKIM and DMARC from bulk senders (since February
 Settings → **Check DNS now** reads these and says what to fix. It needs the
 server to reach public DNS.
 
-### 3.6 Replies
+### 3.7 Replies
 
 Choose one:
 
@@ -283,7 +339,7 @@ Out-of-office and delivery notices are not counted. A reply that just says
 "unsubscribe" or "stop" unsubscribes the person from everything. People can
 also mark a reply received by phone or WhatsApp on the contact.
 
-### 3.7 Website conversions
+### 3.8 Website conversions
 
 When someone clicks a link, TaskFlow adds `tf_ref=<code>` (and UTM tags if the
 link has none). When they complete something on soildoctor.in, the website's
@@ -301,7 +357,7 @@ Content-Type: application/json
 visible. Without `ref`, the person's latest clicked email within the attribution
 window is used.
 
-### 3.8 Before the first campaign
+### 3.9 Before the first campaign
 
 1. Settings: postal address, sender name and address, approved senders,
    reply-to, limits (default: 1 a day, 3 a week per person).
@@ -325,7 +381,7 @@ window is used.
 |---|---|
 | Amazon SES | About **US$0.10 per 1,000 emails** (≈ ₹9). 20,000 emails a month ≈ US$2. Data transfer for images is small because images are served by TaskFlow. Optional dedicated IP ≈ US$25/month (not needed at this volume) |
 | Brevo | Free plan limited to 300 emails a day; paid plans are priced by monthly volume — see brevo.com/pricing |
-| SMTP via Google Workspace | No extra cost, but daily sending limits and the risk to company mailboxes make it unsuitable for bulk |
+| SMTP via Google Workspace | No extra cost beyond the mailbox; about 1,800 emails a day per mailbox (TaskFlow's cap under Google's 2,000) |
 | Writing assistant (Claude Opus 5.5) | US$4 per million input tokens, US$20 per million output tokens: a suggestion is roughly 1,500 tokens in and 300 out ≈ **US$0.01 (≈ ₹1)**. Each person is limited to 30 requests per 10 minutes. Optional |
 | Google Workspace reply mailbox | An existing mailbox; no extra cost |
 | DNS, TaskFlow itself | No extra cost; the database grows by roughly 1–2 KB per email sent plus events |

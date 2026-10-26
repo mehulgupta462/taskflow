@@ -179,6 +179,10 @@ export default function MarketingSettings({ onSaved }) {
     } catch (err) { toast.error(err); }
   };
   const p = view.provider;
+  const gmailSenders = p.gmail && p.account ? [p.account, ...(p.sendAs || [])].map((e) => e.toLowerCase()) : [];
+  const badSenders = gmailSenders.length
+    ? [s.defaultFromEmail, ...(s.senders || []).map((x) => x.email)].filter((e) => e && !gmailSenders.includes(e.trim().toLowerCase()))
+    : [];
 
   return (
     <div className="stack">
@@ -187,12 +191,22 @@ export default function MarketingSettings({ onSaved }) {
       <Section title="Sending" note="The provider and its keys are set on the server (environment variables), never here, so a credential is never shown on screen or stored in the database.">
         <div className="row wrap">
           <Badge tone={p.configured ? (p.delivers ? 'good' : 'warning') : 'critical'}>{p.label}</Badge>
-          {p.configured && !p.delivers && <span className="small">Emails are built and recorded but not delivered. Set EMAIL_PROVIDER to ses, brevo or smtp to send.</span>}
+          {p.configured && !p.delivers && <span className="small">Emails are built and recorded but not delivered. Set EMAIL_PROVIDER to ses, brevo or smtp (a Google Workspace mailbox through smtp.gmail.com) to send.</span>}
           {!p.configured && <span className="small">Missing on the server: {p.missing.join(', ')}</span>}
           {p.region && <span className="small muted">Region {p.region}</span>}
+          {p.account && <span className="small">Sends as {p.account}{p.sendAs?.length ? ` (or ${p.sendAs.join(', ')})` : ''}</span>}
+          {p.limits?.perDay > 0 && <span className="small muted">{p.sentLast24h ?? 0} of {p.limits.perDay.toLocaleString()} in the last 24 hours{p.limits.perMinute ? ` · at most ${p.limits.perMinute} a minute` : ''}</span>}
         </div>
+        {p.paused && (
+          <div className="mkt-callout is-critical small">Sending is paused until {new Date(p.paused.until).toLocaleTimeString()}; waiting emails go out after that. {p.paused.reason}</div>
+        )}
+        {badSenders.length > 0 && (
+          <div className="mkt-callout is-warning small">Gmail sends only as {gmailSenders.join(', ')}. Emails from {[...new Set(badSenders)].join(', ')} will not be sent: use the mailbox’s address as the sender, or add a “Send mail as” alias in Gmail and list it in SMTP_SEND_AS on the server.</div>
+        )}
         {p.configured && p.delivers && (
-          <div className="small dim">Reports back: delivery {p.events.delivery ? 'yes' : 'no'} · bounces {p.events.bounce ? 'yes' : 'no'} · spam complaints {p.events.complaint ? 'yes' : 'no'}{!p.events.bounce && ' — with SMTP, bounces are not suppressed automatically; prefer Amazon SES or Brevo for bulk email.'}</div>
+          <div className="small dim">Reports back: delivery {p.events.delivery ? 'yes' : 'no'} · bounces {p.events.bounce ? 'yes' : 'no'} · spam complaints {p.events.complaint ? 'yes' : 'no'}{!p.events.bounce && (p.gmail
+            ? ' — bounces come back as emails to the mailbox; add those addresses under “Never email” below.'
+            : ' — with SMTP, bounces are not suppressed automatically; prefer Amazon SES or Brevo for bulk email.')}</div>
         )}
         <div className="small muted">Background sender: {view.worker.enabled ? `on, every ${view.worker.interval_seconds} seconds` : 'off on this server (MARKETING_WORKER or ENABLE_SCANNER is false)'} · Writing assistant: {view.keys.anthropic ? 'on' : 'off (ANTHROPIC_API_KEY)'}</div>
         {editable && <div className="row"><button type="button" className="btn btn-sm" onClick={() => runNow('/worker/run', 'Worker ran')}>Run the sender now</button></div>}
